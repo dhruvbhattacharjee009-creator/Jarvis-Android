@@ -11,7 +11,7 @@ android {
 
     defaultConfig {
         applicationId = "com.jarvis.android"
-        minSdk = 23
+        minSdk = 24
         targetSdk = 35
         versionCode = 1
         versionName = "0.1"
@@ -43,6 +43,9 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
 
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
+
 
