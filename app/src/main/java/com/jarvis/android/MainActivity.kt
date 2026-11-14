@@ -3,12 +3,10 @@ package com.jarvis.android
 
 import android.Manifest
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -31,7 +29,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import java.util.Locale
 
 data class ChatMessage(
@@ -47,21 +44,56 @@ private val Muted = Color(0xFF91A7BA)
 class MainActivity : ComponentActivity() {
 
     private var speechRecognizer: SpeechRecognizer? = null
-    private var textToSpeech: TextToSpeech? = null
+    private var voiceEngine: VoiceEngine? = null
+
+    private val availableVoices = mutableStateListOf<String>()
+
+    private var voiceReady by mutableStateOf(false)
+    private var selectedVoice by mutableStateOf("")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        textToSpeech = TextToSpeech(this) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                textToSpeech?.language = Locale.US
+        voiceEngine = VoiceEngine(this) {
+            runOnUiThread {
+                voiceReady = true
+
+                availableVoices.clear()
+                availableVoices.addAll(
+                    voiceEngine?.getAvailableVoices()
+                        ?.map { it.name }
+                        ?: emptyList()
+                )
+
+                if (availableVoices.isNotEmpty()) {
+                    selectedVoice = availableVoices.first()
+                }
             }
         }
 
         setContent {
             JarvisApp(
+                voices = availableVoices,
+                voiceReady = voiceReady,
+                selectedVoice = selectedVoice,
                 onListen = { callback ->
                     startListening(callback)
+                },
+                onSelectVoice = { name ->
+                    val success =
+                        voiceEngine?.selectVoice(name) ?: false
+
+                    if (success) {
+                        selectedVoice = name
+                    }
+
+                    success
+                },
+                onPreviewVoice = { name ->
+                    voiceEngine?.previewVoice(name)
+                },
+                onSpeak = { message ->
+                    voiceEngine?.speak(message)
                 }
             )
         }
@@ -78,6 +110,7 @@ class MainActivity : ComponentActivity() {
 
         speechRecognizer?.setRecognitionListener(
             object : RecognitionListener {
+
                 override fun onReadyForSpeech(params: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {}
@@ -87,49 +120,56 @@ class MainActivity : ComponentActivity() {
                 override fun onPartialResults(results: Bundle?) {}
 
                 override fun onError(error: Int) {
-                    callback("I couldn't recognize that. Please try again.")
+                    callback(
+                        "I couldn't recognize that. Please try again."
+                    )
                 }
 
                 override fun onResults(results: Bundle?) {
                     val words = results?.getStringArrayList(
                         SpeechRecognizer.RESULTS_RECOGNITION
                     )
-                    callback(words?.firstOrNull() ?: "No speech detected.")
+
+                    callback(
+                        words?.firstOrNull() ?: "No speech detected."
+                    )
                 }
             }
         )
 
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        val intent = Intent(
+            RecognizerIntent.ACTION_RECOGNIZE_SPEECH
+        ).apply {
             putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
             )
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US)
+            putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE,
+                Locale.US
+            )
         }
 
         speechRecognizer?.startListening(intent)
     }
 
-    private fun speak(text: String) {
-        textToSpeech?.speak(
-            text,
-            TextToSpeech.QUEUE_FLUSH,
-            null,
-            "JARVIS_RESPONSE"
-        )
-    }
-
     override fun onDestroy() {
         speechRecognizer?.destroy()
-        textToSpeech?.stop()
-        textToSpeech?.shutdown()
+        voiceEngine?.release()
         super.onDestroy()
     }
 }
 
 @Composable
-fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
-
+fun JarvisApp(
+    voices: List<String>,
+    voiceReady: Boolean,
+    selectedVoice: String,
+    onListen: ((String) -> Unit) -> Unit,
+    onSelectVoice: (String) -> Boolean,
+    onPreviewVoice: (String) -> Unit,
+    onSpeak: (String) -> Unit
+) {
     var page by remember { mutableStateOf("HOME") }
     var input by remember { mutableStateOf("") }
     var listening by remember { mutableStateOf(false) }
@@ -137,7 +177,7 @@ fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
     val messages = remember {
         mutableStateListOf(
             ChatMessage(
-                "Good day. JARVIS interface initialized. Cloud intelligence is the next development milestone.",
+                "Welcome. JARVIS is ready. Voice controls are available. Cloud intelligence is the next development milestone.",
                 false
             )
         )
@@ -149,6 +189,7 @@ fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
         ) { granted ->
             if (granted) {
                 listening = true
+
                 onListen { result ->
                     input = result
                     listening = false
@@ -172,9 +213,12 @@ fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
                     containerColor = Color(0xFF0B1421)
                 ) {
                     val pages = listOf(
-                        "HOME", "CHAT", "FILES", "ABOUT"
+                        "HOME", "CHAT", "FILES", "VOICE", "ABOUT"
                     )
-                    val symbols = listOf("⌂", "◉", "▤", "ⓘ")
+
+                    val symbols = listOf(
+                        "⌂", "◉", "▤", "♫", "ⓘ"
+                    )
 
                     pages.forEachIndexed { index, name ->
                         NavigationBarItem(
@@ -183,11 +227,11 @@ fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
                             icon = {
                                 Text(
                                     symbols[index],
-                                    fontSize = 21.sp
+                                    fontSize = 19.sp
                                 )
                             },
                             label = {
-                                Text(name, fontSize = 9.sp)
+                                Text(name, fontSize = 8.sp)
                             },
                             colors = NavigationBarItemDefaults.colors(
                                 selectedIconColor = Cyan,
@@ -225,7 +269,8 @@ fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
                                 )
                             }
                         },
-                        onChat = { page = "CHAT" }
+                        onChat = { page = "CHAT" },
+                        onVoice = { page = "VOICE" }
                     )
 
                     "CHAT" -> ChatScreen(
@@ -234,22 +279,38 @@ fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
                         onInput = { input = it },
                         onSend = {
                             val command = input.trim()
+
                             if (command.isNotEmpty()) {
                                 messages.add(
                                     ChatMessage(command, true)
                                 )
+
+                                val reply =
+                                    "I have received your message. Real AI conversations will be enabled when the secure AI backend is connected."
+
                                 messages.add(
-                                    ChatMessage(
-                                        "Your message is received. Cloud AI integration is coming in Phase 2.3.",
-                                        false
-                                    )
+                                    ChatMessage(reply, false)
                                 )
+
+                                onSpeak(reply)
                                 input = ""
                             }
                         }
                     )
 
                     "FILES" -> FilesScreen()
+
+                    "VOICE" -> VoiceSettingsScreen(
+                        voices = voices,
+                        voiceReady = voiceReady,
+                        selectedVoice = selectedVoice,
+                        onSelect = { name ->
+                            onSelectVoice(name)
+                        },
+                        onPreview = { name ->
+                            onPreviewVoice(name)
+                        }
+                    )
 
                     "ABOUT" -> AboutScreen()
                 }
@@ -262,7 +323,8 @@ fun JarvisApp(onListen: ((String) -> Unit) -> Unit) {
 fun HomeScreen(
     listening: Boolean,
     onActivate: () -> Unit,
-    onChat: () -> Unit
+    onChat: () -> Unit,
+    onVoice: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -280,20 +342,28 @@ fun HomeScreen(
         )
 
         Text(
-            "PERSONAL INTELLIGENCE SYSTEM",
+            "THINK · ASK · ACHIEVE",
             color = Muted,
-            fontSize = 9.sp,
-            letterSpacing = 3.sp
+            fontSize = 11.sp,
+            letterSpacing = 2.sp
         )
 
         Spacer(Modifier.height(34.dp))
 
         Box(
             modifier = Modifier
-                .size(230.dp)
-                .border(1.dp, Cyan.copy(alpha = 0.35f), CircleShape)
+                .size(220.dp)
+                .border(
+                    1.dp,
+                    Cyan.copy(alpha = 0.35f),
+                    CircleShape
+                )
                 .padding(13.dp)
-                .border(1.dp, Cyan.copy(alpha = 0.55f), CircleShape)
+                .border(
+                    1.dp,
+                    Cyan.copy(alpha = 0.55f),
+                    CircleShape
+                )
                 .padding(13.dp)
                 .background(
                     Brush.radialGradient(
@@ -305,25 +375,19 @@ fun HomeScreen(
                     ),
                     CircleShape
                 )
-                .border(2.dp, Cyan.copy(alpha = 0.7f), CircleShape),
+                .border(
+                    2.dp,
+                    Cyan.copy(alpha = 0.7f),
+                    CircleShape
+                ),
             contentAlignment = Alignment.Center
         ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    "J",
-                    color = Cyan,
-                    fontSize = 76.sp,
-                    fontWeight = FontWeight.ExtraLight
-                )
-                Text(
-                    "ARTIFICIAL INTELLIGENCE",
-                    color = Color.White,
-                    fontSize = 8.sp,
-                    letterSpacing = 2.sp
-                )
-            }
+            Text(
+                "J",
+                color = Cyan,
+                fontSize = 88.sp,
+                fontWeight = FontWeight.ExtraLight
+            )
         }
 
         Spacer(Modifier.height(24.dp))
@@ -336,52 +400,55 @@ fun HomeScreen(
         )
 
         Text(
-            "Awaiting your command",
+            "Your personal assistant",
             color = Muted,
             fontSize = 13.sp
         )
 
-        Spacer(Modifier.height(30.dp))
+        Spacer(Modifier.height(28.dp))
 
         Button(
             onClick = onActivate,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(58.dp),
+                .height(56.dp),
             colors = ButtonDefaults.buttonColors(
                 containerColor = Color(0xFF087B9C)
             ),
             shape = RoundedCornerShape(18.dp)
         ) {
             Text(
-                if (listening) "LISTENING..." else "◉   ACTIVATE VOICE",
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 1.sp
+                if (listening) "LISTENING..."
+                else "◉   ACTIVATE VOICE",
+                fontWeight = FontWeight.Bold
             )
         }
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(12.dp))
 
         OutlinedButton(
             onClick = onChat,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(54.dp),
-            border = ButtonDefaults.outlinedButtonBorder
+                .height(52.dp)
         ) {
             Text("OPEN CONVERSATION", color = Cyan)
+        }
+
+        TextButton(onClick = onVoice) {
+            Text("VOICE SETTINGS", color = Cyan)
         }
 
         Spacer(Modifier.weight(1f))
 
         Text(
-            "JARVIS CORE  •  PHASE 2",
+            "JARVIS ANDROID  •  PHASE 2",
             color = Muted,
             fontSize = 10.sp,
             letterSpacing = 2.sp
         )
 
-        Spacer(Modifier.height(18.dp))
+        Spacer(Modifier.height(16.dp))
     }
 }
 
@@ -405,10 +472,9 @@ fun ChatScreen(
         )
 
         Text(
-            "INTELLIGENT CONVERSATION",
+            "THINK · ASK · ACHIEVE",
             color = Muted,
-            fontSize = 10.sp,
-            letterSpacing = 2.sp
+            fontSize = 10.sp
         )
 
         Spacer(Modifier.height(18.dp))
@@ -422,10 +488,8 @@ fun ChatScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(
-                            if (message.isUser)
-                                Color(0xFF14364A)
-                            else
-                                Panel,
+                            if (message.isUser) Color(0xFF14364A)
+                            else Panel,
                             RoundedCornerShape(16.dp)
                         )
                         .padding(15.dp)
@@ -453,9 +517,7 @@ fun ChatScreen(
                 value = input,
                 onValueChange = onInput,
                 modifier = Modifier.weight(1f),
-                placeholder = {
-                    Text("Ask JARVIS...")
-                },
+                placeholder = { Text("Ask JARVIS...") },
                 shape = RoundedCornerShape(15.dp),
                 singleLine = true
             )
@@ -470,6 +532,149 @@ fun ChatScreen(
 }
 
 @Composable
+fun VoiceSettingsScreen(
+    voices: List<String>,
+    voiceReady: Boolean,
+    selectedVoice: String,
+    onSelect: (String) -> Unit,
+    onPreview: (String) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(22.dp)
+    ) {
+        Text(
+            "VOICE SETTINGS",
+            color = Cyan,
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold
+        )
+
+        Spacer(Modifier.height(8.dp))
+
+        Text(
+            "Choose and preview a voice installed on your device.",
+            color = Muted,
+            fontSize = 13.sp
+        )
+
+        Spacer(Modifier.height(20.dp))
+
+        when {
+            !voiceReady -> {
+                CircularProgressIndicator(color = Cyan)
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Initializing voice engine...",
+                    color = Muted
+                )
+            }
+
+            voices.isEmpty() -> {
+                Text(
+                    "No English voices were found. Install an English voice in your Android Text-to-Speech settings and reopen JARVIS.",
+                    color = Color.White
+                )
+            }
+
+            else -> {
+                Text(
+                    "AVAILABLE ENGLISH VOICES",
+                    color = Cyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+
+                Spacer(Modifier.height(12.dp))
+
+                LazyColumn(
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(voices) { voice ->
+                        VoiceItem(
+                            voiceName = voice,
+                            selected = voice == selectedVoice,
+                            onSelect = { onSelect(voice) },
+                            onPreview = { onPreview(voice) }
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        Text(
+            "Voice availability depends on your phone's installed Text-to-Speech engine. Male and female labels are not guaranteed by Android.",
+            color = Muted,
+            fontSize = 11.sp,
+            lineHeight = 17.sp
+        )
+    }
+}
+
+@Composable
+fun VoiceItem(
+    voiceName: String,
+    selected: Boolean,
+    onSelect: () -> Unit,
+    onPreview: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                Panel,
+                RoundedCornerShape(15.dp)
+            )
+            .border(
+                1.dp,
+                if (selected) Cyan else Color.Transparent,
+                RoundedCornerShape(15.dp)
+            )
+            .padding(14.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            RadioButton(
+                selected = selected,
+                onClick = onSelect,
+                colors = RadioButtonDefaults.colors(
+                    selectedColor = Cyan
+                )
+            )
+
+            Column(
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(
+                    voiceName,
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium
+                )
+
+                Text(
+                    if (selected) "Currently selected"
+                    else "Installed voice",
+                    color = Muted,
+                    fontSize = 10.sp
+                )
+            }
+        }
+
+        OutlinedButton(
+            onClick = onPreview,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("▶  PREVIEW VOICE", color = Cyan)
+        }
+    }
+}
+
+@Composable
 fun FilesScreen() {
     Column(
         modifier = Modifier
@@ -478,8 +683,13 @@ fun FilesScreen() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("DOCUMENT INTELLIGENCE", color = Cyan, fontSize = 21.sp,
-            fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text(
+            "DOCUMENT INTELLIGENCE",
+            color = Cyan,
+            fontSize = 21.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center
+        )
 
         Spacer(Modifier.height(20.dp))
 
@@ -494,7 +704,7 @@ fun FilesScreen() {
         Spacer(Modifier.height(8.dp))
 
         Text(
-            "PDF analysis, document questions, summaries and file uploads will be implemented in Phase 2.4.",
+            "PDF analysis, document questions, summaries and file uploads are planned for Phase 2.4.",
             color = Muted,
             textAlign = TextAlign.Center
         )
@@ -506,11 +716,8 @@ fun AboutScreen() {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .padding(22.dp)
     ) {
-        Spacer(Modifier.height(30.dp))
-
         Text(
             "ABOUT JARVIS",
             color = Cyan,
@@ -518,49 +725,68 @@ fun AboutScreen() {
             fontWeight = FontWeight.Bold
         )
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(8.dp))
 
         Text(
-            "A personal AI assistant project",
-            color = Muted
+            "THINK · ASK · ACHIEVE",
+            color = Muted,
+            fontSize = 11.sp,
+            letterSpacing = 2.sp
         )
 
-        Spacer(Modifier.height(35.dp))
+        Spacer(Modifier.height(24.dp))
 
-        CreditCard("PROJECT CREATOR", "Dhruv Bhattacharjee")
+        CreditCard(
+            "PROJECT CREATOR",
+            "Dhruv Bhattacharjee"
+        )
 
-        CreditCard("AI DEVELOPMENT ASSISTANT", "ChatGPT by OpenAI")
+        CreditCard(
+            "ABOUT THE DEVELOPER",
+            "Dhruv is a student and aspiring developer interested in artificial intelligence, software engineering, science and innovation. He enjoys exploring ambitious ideas and turning concepts into useful technology projects."
+        )
 
-        CreditCard("PROJECT", "JARVIS Android")
+        CreditCard(
+            "AI DEVELOPMENT ASSISTANT",
+            "ChatGPT by OpenAI"
+        )
 
-        Spacer(Modifier.height(25.dp))
+        CreditCard(
+            "OPENAI CONTRIBUTION",
+            "ChatGPT assisted with research, architecture planning, programming guidance, debugging and design exploration. The project vision and ownership belong to its creator."
+        )
 
-        Text(
-            "Our vision is to build a powerful personal assistant using cloud AI, voice interaction and intelligent tools.",
-            color = Color.White,
-            textAlign = TextAlign.Center,
-            lineHeight = 23.sp
+        CreditCard(
+            "PROJECT",
+            "JARVIS Android"
         )
 
         Spacer(Modifier.weight(1f))
 
         Text(
-            "VERSION 0.2  •  PHASE 2",
+            "INDEPENDENT PROJECT • VERSION 0.2",
             color = Muted,
             fontSize = 10.sp,
-            letterSpacing = 2.sp
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
         )
     }
 }
 
 @Composable
-fun CreditCard(title: String, value: String) {
+fun CreditCard(
+    title: String,
+    value: String
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 7.dp)
-            .background(Panel, RoundedCornerShape(15.dp))
-            .padding(17.dp)
+            .padding(vertical = 6.dp)
+            .background(
+                Panel,
+                RoundedCornerShape(15.dp)
+            )
+            .padding(15.dp)
     ) {
         Text(
             title,
@@ -575,7 +801,9 @@ fun CreditCard(title: String, value: String) {
         Text(
             value,
             color = Color.White,
-            fontSize = 16.sp
+            fontSize = 13.sp,
+            lineHeight = 19.sp
         )
     }
 }
+
