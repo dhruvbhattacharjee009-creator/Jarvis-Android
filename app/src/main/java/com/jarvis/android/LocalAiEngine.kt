@@ -1,4 +1,3 @@
-
 package com.jarvis.android
 
 import android.content.Context
@@ -110,7 +109,11 @@ class LocalAiEngine(context: Context) {
 
                         override fun onMessage(message: Message) {
                             mainHandler.post {
-                                onText(message.text)
+onText(
+    message.contents.contents
+        .filterIsInstance<com.google.ai.edge.litertlm.Content.Text>()
+        .joinToString(separator = "") { it.text }
+)
                             }
                         }
 
