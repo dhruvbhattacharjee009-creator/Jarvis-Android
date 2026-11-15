@@ -4,14 +4,15 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import com.google.ai.edge.litertlm.Backend
-import com.google.ai.edge.litertlm.Engine
-import com.google.ai.edge.litertlm.EngineConfig
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Conversation
 import com.google.ai.edge.litertlm.ConversationConfig
-import com.google.ai.edge.litertlm.Contents
-import com.google.ai.edge.litertlm.SamplerConfig
+import com.google.ai.edge.litertlm.Engine
+import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
+import com.google.ai.edge.litertlm.SamplerConfig
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -33,10 +34,19 @@ class LocalAiEngine(context: Context) {
     ) {
         executor.execute {
             try {
-                check(!closed) { "AI engine is closed." }
+                check(!closed) {
+                    "AI engine is closed."
+                }
+
                 check(modelFile.exists()) {
                     "AI model is not downloaded yet."
                 }
+
+                conversation?.close()
+                conversation = null
+
+                engine?.close()
+                engine = null
 
                 val newEngine = Engine(
                     EngineConfig(
@@ -94,7 +104,9 @@ class LocalAiEngine(context: Context) {
     ) {
         executor.execute {
             try {
-                check(!closed) { "AI engine is closed." }
+                check(!closed) {
+                    "AI engine is closed."
+                }
 
                 val activeConversation =
                     conversation ?: error("AI model is not ready.")
@@ -108,12 +120,14 @@ class LocalAiEngine(context: Context) {
                     object : MessageCallback {
 
                         override fun onMessage(message: Message) {
-                            mainHandler.post {
-onText(
-    message.contents.contents
-        .filterIsInstance<com.google.ai.edge.litertlm.Content.Text>()
-        .joinToString(separator = "") { it.text }
-)
+                            val response = message.contents.contents
+                                .filterIsInstance<Content.Text>()
+                                .joinToString("") { it.text }
+
+                            if (response.isNotEmpty()) {
+                                mainHandler.post {
+                                    onText(response)
+                                }
                             }
                         }
 
@@ -158,3 +172,4 @@ onText(
         executor.shutdown()
     }
 }
+
