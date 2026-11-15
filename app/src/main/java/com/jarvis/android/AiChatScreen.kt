@@ -11,6 +11,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.util.Locale
 
 @Composable
 fun AiChatScreen(
@@ -18,11 +19,13 @@ fun AiChatScreen(
     onSpeak: (String) -> Unit
 ) {
     var input by remember { mutableStateOf("") }
+
     var status by remember {
         mutableStateOf(
             AiControllerState("AI model is not set up yet.")
         )
     }
+
     var busy by remember { mutableStateOf(false) }
 
     val messages = remember {
@@ -31,6 +34,15 @@ fun AiChatScreen(
                 "Welcome to MINIMAL. Set up the offline AI model to begin chatting.",
                 false
             )
+        )
+    }
+
+    fun formatSize(bytes: Long): String {
+        if (bytes <= 0L) return "Calculating..."
+        return String.format(
+            Locale.US,
+            "%.1f MB",
+            bytes / (1024.0 * 1024.0)
         )
     }
 
@@ -54,6 +66,40 @@ fun AiChatScreen(
         )
 
         if (!status.isReady) {
+            Spacer(Modifier.height(14.dp))
+
+            if (status.isBusy || status.progress > 0) {
+                LinearProgressIndicator(
+                    progress = {
+                        status.progress.coerceIn(0, 100) / 100f
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(9.dp),
+                    color = Color(0xFF00D9FF),
+                    trackColor = Color(0xFF26384A)
+                )
+
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        "${status.progress.coerceIn(0, 100)}%",
+                        color = Color(0xFF00D9FF),
+                        fontSize = 14.sp
+                    )
+
+                    Text(
+                        "${formatSize(status.downloadedBytes)} / ${formatSize(status.totalBytes)}",
+                        color = Color(0xFF91A7BA),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+
             Spacer(Modifier.height(10.dp))
 
             Button(
@@ -68,15 +114,21 @@ fun AiChatScreen(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
-                    if (busy) "SETTING UP AI..."
-                    else "DOWNLOAD / INITIALIZE AI"
+                    if (busy) "DOWNLOADING / INITIALIZING..."
+                    else "DOWNLOAD / RETRY AI SETUP"
                 )
             }
 
             Text(
-                "The model is a large download. Use Wi-Fi and keep sufficient storage available.",
+                "Download requires an unmetered connection (usually Wi-Fi). Keep MINIMAL open while the model downloads.",
                 color = Color(0xFF91A7BA),
                 fontSize = 11.sp
+            )
+        } else {
+            Text(
+                "OFFLINE AI READY",
+                color = Color(0xFF00D9FF),
+                fontSize = 14.sp
             )
         }
 
