@@ -1,4 +1,4 @@
-# JARVIS ANDROID
+# MININAL ANDROID
 
 An Android AI voice assistant project.
 
