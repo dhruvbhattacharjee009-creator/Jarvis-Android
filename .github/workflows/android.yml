@@ -1,9 +1,8 @@
-
-name: Build Jarvis Android
+name: Build MINIMAL Android
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   workflow_dispatch:
 
 jobs:
@@ -18,12 +17,25 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
       - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: "8.7"
+
+      - name: Prepare stable debug signing key
+        env:
+          MINIMAL_DEBUG_KEYSTORE_BASE64: ${{ secrets.MINIMAL_DEBUG_KEYSTORE_BASE64 }}
+          MINIMAL_DEBUG_STORE_PASSWORD: ${{ secrets.MINIMAL_DEBUG_STORE_PASSWORD }}
+        run: |
+          if [ -z "$MINIMAL_DEBUG_KEYSTORE_BASE64" ] || [ -z "$MINIMAL_DEBUG_STORE_PASSWORD" ]; then
+            echo "::error::Add both signing secrets in GitHub repository Settings."
+            exit 1
+          fi
+
+          printf '%s' "$MINIMAL_DEBUG_KEYSTORE_BASE64" | base64 --decode > app/ci-debug.keystore
+          echo "MINIMAL_DEBUG_STORE_PASSWORD=$MINIMAL_DEBUG_STORE_PASSWORD" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         run: gradle :app:assembleDebug
@@ -31,5 +43,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-Android-APK
+          name: MINIMAL-APK
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
