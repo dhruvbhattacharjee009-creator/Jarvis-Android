@@ -1,0 +1,1658 @@
+From 67ba3ecfbe564e76e4ce8cd0c7385ca98277c584 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 15 Nov 2026 12:30:45 +0530
+Subject: [PATCH] Fix model download stall and rebuild chat/setup UI
+
+- Download: stop forcing unmetered-only; add "any network" option, preflight
+  server check (HTTP errors, storage), persisted download id and completion
+  flag so partial files are never loaded, real failure reasons.
+- UI: setup card with progress/speed/cancel/retry, state kept across tabs,
+  chat bubbles, auto-scroll, keyboard handling, voice text goes to chat.
+- Manifest: dark theme, no activity recreation on rotation.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MwzBpVHWoXsxXcXxgFHyuZ
+---
+ app/src/main/AndroidManifest.xml              |   6 +-
+ .../java/com/jarvis/android/AiChatScreen.kt   | 538 ++++++++++++------
+ .../java/com/jarvis/android/AiController.kt   | 472 +++++++++++----
+ .../java/com/jarvis/android/LocalAiEngine.kt  |   6 +
+ .../java/com/jarvis/android/MainActivity.kt   |  37 +-
+ .../com/jarvis/android/ModelDownloader.kt     | 209 +++++--
+ .../java/com/jarvis/android/VoiceEngine.kt    |   2 +-
+ 7 files changed, 939 insertions(+), 331 deletions(-)
+
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 35132c4..77e658d 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -18,7 +18,7 @@
+         android:allowBackup="true"
+         android:label="MINIMAL"
+         android:supportsRtl="true"
+-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
++        android:theme="@android:style/Theme.Material.NoActionBar">
+ 
+         <uses-native-library
+             android:name="libvndksupport.so"
+@@ -30,7 +30,9 @@
+ 
+         <activity
+             android:name=".MainActivity"
+-            android:exported="true">
++            android:exported="true"
++            android:windowSoftInputMode="adjustResize"
++            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode">
+ 
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+diff --git a/app/src/main/java/com/jarvis/android/AiChatScreen.kt b/app/src/main/java/com/jarvis/android/AiChatScreen.kt
+index c35a0a7..d16aa5e 100644
+--- a/app/src/main/java/com/jarvis/android/AiChatScreen.kt
++++ b/app/src/main/java/com/jarvis/android/AiChatScreen.kt
+@@ -1,230 +1,446 @@
+ package com.jarvis.android
+ 
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.border
+ import androidx.compose.foundation.layout.*
+ import androidx.compose.foundation.lazy.LazyColumn
+-import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.lazy.itemsIndexed
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.*
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.ImeAction
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import java.util.Locale
+ 
++private val ChatCyan = Color(0xFF38DDF5)
++private val ChatPanel = Color(0xFF111B2A)
++private val ChatBorder = Color(0xFF22384B)
++private val ChatMuted = Color(0xFF91A4B8)
++private val ChatText = Color(0xFFF1F6FC)
++private val ChatError = Color(0xFFFF8A80)
++private val ChatGreen = Color(0xFF5CE0A0)
++private val ChatWarn = Color(0xFFFFC857)
++
++private fun formatBytes(bytes: Long): String {
++    if (bytes <= 0L) return "--"
++    val mb = bytes / (1024.0 * 1024.0)
++    return if (mb >= 1024) {
++        String.format(Locale.US, "%.2f GB", mb / 1024.0)
++    } else {
++        String.format(Locale.US, "%.0f MB", mb)
++    }
++}
++
+ @Composable
+ fun AiChatScreen(
+     controller: AiController,
++    pendingVoiceText: String,
++    onVoiceTextConsumed: () -> Unit,
+     onSpeak: (String) -> Unit
+ ) {
++    val state = controller.state
++    val messages = controller.messages
++    val generating = controller.generating
++
+     var input by remember { mutableStateOf("") }
++    val listState = rememberLazyListState()
+ 
+-    var status by remember {
+-        mutableStateOf(
+-            AiControllerState("AI model is not set up yet.")
+-        )
++    // Voice result from the Home screen: send it straight away when the
++    // AI is ready, otherwise leave it in the input box.
++    LaunchedEffect(pendingVoiceText) {
++        if (pendingVoiceText.isNotBlank()) {
++            if (state.isReady && !generating) {
++                controller.send(pendingVoiceText, onSpeak)
++            } else {
++                input = pendingVoiceText
++            }
++            onVoiceTextConsumed()
++        }
+     }
+ 
+-    var busy by remember { mutableStateOf(false) }
+-
+-    val messages = remember {
+-        mutableStateListOf(
+-            ChatMessage(
+-                "Welcome to MINIMAL. Set up the offline AI model to begin chatting.",
+-                false
+-            )
+-        )
++    // Keep the newest message in view while the reply streams in.
++    val lastText = messages.lastOrNull()?.message
++    LaunchedEffect(messages.size, lastText) {
++        if (messages.isNotEmpty()) {
++            listState.scrollToItem(messages.lastIndex)
++        }
+     }
+ 
+-    fun formatSize(bytes: Long): String {
+-        if (bytes <= 0L) return "Calculating..."
+-        return String.format(
+-            Locale.US,
+-            "%.1f MB",
+-            bytes / (1024.0 * 1024.0)
+-        )
++    fun submit() {
++        val prompt = input.trim()
++        if (prompt.isNotEmpty() && state.isReady && !generating) {
++            input = ""
++            controller.send(prompt, onSpeak)
++        }
+     }
+ 
+     Column(
+         modifier = Modifier
+             .fillMaxSize()
+-            .padding(18.dp)
++            .imePadding()
++            .padding(horizontal = 16.dp)
++            .padding(top = 14.dp, bottom = 10.dp)
+     ) {
+-        Text(
+-            "MINIMAL AI CHAT",
+-            color = Color(0xFF00D9FF),
+-            fontSize = 22.sp
+-        )
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            Text(
++                "MINIMAL AI",
++                color = ChatCyan,
++                fontSize = 22.sp,
++                fontWeight = FontWeight.Bold,
++                letterSpacing = 2.sp,
++                modifier = Modifier.weight(1f)
++            )
+ 
+-        Spacer(Modifier.height(8.dp))
++            StatusPill(state)
++        }
+ 
+-        Text(
+-            status.message,
+-            color = Color(0xFF91A7BA),
+-            fontSize = 12.sp
+-        )
++        Spacer(Modifier.height(12.dp))
++
++        if (!state.isReady) {
++            SetupCard(state, controller)
++            Spacer(Modifier.height(12.dp))
++        }
+ 
+-        if (!status.isReady) {
+-            Spacer(Modifier.height(14.dp))
+-
+-            if (status.isBusy || status.progress > 0) {
+-                LinearProgressIndicator(
+-                    progress = {
+-                        status.progress.coerceIn(0, 100) / 100f
+-                    },
+-                    modifier = Modifier
+-                        .fillMaxWidth()
+-                        .height(9.dp),
+-                    color = Color(0xFF00D9FF),
+-                    trackColor = Color(0xFF26384A)
++        LazyColumn(
++            state = listState,
++            modifier = Modifier
++                .weight(1f)
++                .fillMaxWidth(),
++            verticalArrangement = Arrangement.spacedBy(10.dp)
++        ) {
++            itemsIndexed(messages) { index, message ->
++                val isLast = index == messages.lastIndex
++                MessageBubble(
++                    message = message,
++                    thinking = isLast &&
++                        generating &&
++                        !message.isUser &&
++                        message.message.isEmpty()
+                 )
++            }
++        }
+ 
+-                Spacer(Modifier.height(8.dp))
++        Spacer(Modifier.height(10.dp))
+ 
+-                Row(
+-                    modifier = Modifier.fillMaxWidth(),
+-                    horizontalArrangement = Arrangement.SpaceBetween
+-                ) {
++        Row(verticalAlignment = Alignment.Bottom) {
++            OutlinedTextField(
++                value = input,
++                onValueChange = { input = it },
++                modifier = Modifier.weight(1f),
++                placeholder = {
+                     Text(
+-                        "${status.progress.coerceIn(0, 100)}%",
+-                        color = Color(0xFF00D9FF),
++                        if (state.isReady) "Ask MINIMAL..."
++                        else "Set up the AI to start chatting",
+                         fontSize = 14.sp
+                     )
++                },
++                maxLines = 4,
++                enabled = state.isReady && !generating,
++                shape = RoundedCornerShape(16.dp),
++                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
++                keyboardActions = KeyboardActions(onSend = { submit() })
++            )
+ 
+-                    Text(
+-                        "${formatSize(status.downloadedBytes)} / ${formatSize(status.totalBytes)}",
+-                        color = Color(0xFF91A7BA),
+-                        fontSize = 12.sp
+-                    )
+-                }
+-            }
+-
+-            Spacer(Modifier.height(10.dp))
++            Spacer(Modifier.width(8.dp))
+ 
+             Button(
+-                onClick = {
+-                    busy = true
+-                    controller.prepare { newState ->
+-                        status = newState
+-                        busy = newState.isBusy
+-                    }
+-                },
+-                enabled = !busy,
+-                modifier = Modifier.fillMaxWidth()
++                onClick = { submit() },
++                enabled = state.isReady &&
++                    !generating &&
++                    input.isNotBlank(),
++                modifier = Modifier.height(56.dp),
++                shape = RoundedCornerShape(16.dp)
+             ) {
+-                Text(
+-                    if (busy) "DOWNLOADING / INITIALIZING..."
+-                    else "DOWNLOAD / RETRY AI SETUP"
+-                )
++                Text("SEND", fontWeight = FontWeight.Bold)
+             }
+-
+-            Text(
+-                "Download requires an unmetered connection (usually Wi-Fi). Keep MINIMAL open while the model downloads.",
+-                color = Color(0xFF91A7BA),
+-                fontSize = 11.sp
+-            )
+-        } else {
+-            Text(
+-                "OFFLINE AI READY",
+-                color = Color(0xFF00D9FF),
+-                fontSize = 14.sp
+-            )
+         }
++    }
++}
+ 
+-        Spacer(Modifier.height(14.dp))
++@Composable
++private fun StatusPill(state: AiControllerState) {
++    val (label, color) = when (state.phase) {
++        SetupPhase.READY -> "READY" to ChatGreen
++        SetupPhase.ERROR -> "ERROR" to ChatError
++        SetupPhase.IDLE -> "NOT SET UP" to ChatMuted
++        SetupPhase.LOADING -> "LOADING" to ChatWarn
++        SetupPhase.CHECKING,
++        SetupPhase.DOWNLOADING,
++        SetupPhase.WAITING_NETWORK -> "SETTING UP" to ChatWarn
++    }
+ 
+-        LazyColumn(
+-            modifier = Modifier.weight(1f),
+-            verticalArrangement = Arrangement.spacedBy(10.dp)
+-        ) {
+-            items(messages) { message ->
+-                Column(
+-                    modifier = Modifier
+-                        .fillMaxWidth()
+-                        .background(
+-                            if (message.isUser)
+-                                Color(0xFF14364A)
+-                            else Color(0xFF101D2D),
+-                            RoundedCornerShape(14.dp)
+-                        )
+-                        .padding(14.dp)
++    Row(
++        modifier = Modifier
++            .background(Color(0xFF123044), CircleShape)
++            .border(1.dp, color.copy(alpha = 0.5f), CircleShape)
++            .padding(horizontal = 12.dp, vertical = 6.dp),
++        verticalAlignment = Alignment.CenterVertically
++    ) {
++        Box(
++            Modifier
++                .size(7.dp)
++                .background(color, CircleShape)
++        )
++        Spacer(Modifier.width(7.dp))
++        Text(
++            label,
++            color = color,
++            fontSize = 10.sp,
++            fontWeight = FontWeight.Bold,
++            letterSpacing = 1.sp
++        )
++    }
++}
++
++@Composable
++private fun SetupCard(
++    state: AiControllerState,
++    controller: AiController
++) {
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .background(ChatPanel, RoundedCornerShape(16.dp))
++            .border(1.dp, ChatBorder, RoundedCornerShape(16.dp))
++            .padding(16.dp)
++    ) {
++        when (state.phase) {
++            SetupPhase.IDLE, SetupPhase.ERROR -> {
++                val isError = state.phase == SetupPhase.ERROR
++
++                Text(
++                    if (isError) "Setup problem" else "Set up offline AI",
++                    color = if (isError) ChatError else ChatText,
++                    fontSize = 15.sp,
++                    fontWeight = FontWeight.SemiBold
++                )
++                Spacer(Modifier.height(6.dp))
++                Text(
++                    state.message,
++                    color = ChatMuted,
++                    fontSize = 13.sp,
++                    lineHeight = 19.sp
++                )
++                Spacer(Modifier.height(4.dp))
++                Text(
++                    "One-time download. After that MINIMAL works fully offline.",
++                    color = ChatMuted,
++                    fontSize = 12.sp,
++                    lineHeight = 17.sp
++                )
++                Spacer(Modifier.height(14.dp))
++
++                Button(
++                    onClick = { controller.prepare(allowMetered = false) },
++                    modifier = Modifier.fillMaxWidth(),
++                    shape = RoundedCornerShape(14.dp)
+                 ) {
+                     Text(
+-                        if (message.isUser) "YOU" else "MINIMAL",
+-                        color = Color(0xFF00D9FF),
+-                        fontSize = 10.sp
++                        if (isError) "RETRY" else "DOWNLOAD (WI-FI)",
++                        fontWeight = FontWeight.Bold
+                     )
++                }
++
++                Spacer(Modifier.height(8.dp))
+ 
+-                    Spacer(Modifier.height(5.dp))
++                OutlinedButton(
++                    onClick = { controller.prepare(allowMetered = true) },
++                    modifier = Modifier.fillMaxWidth(),
++                    shape = RoundedCornerShape(14.dp)
++                ) {
++                    Text("DOWNLOAD ON ANY NETWORK", color = ChatCyan)
++                }
++
++                Text(
++                    "\"Any network\" also uses mobile data and hotspots. " +
++                        "The model is a large file.",
++                    color = ChatMuted,
++                    fontSize = 11.sp,
++                    lineHeight = 16.sp,
++                    modifier = Modifier.padding(top = 6.dp)
++                )
+ 
++                if (state.canReset) {
++                    TextButton(
++                        onClick = { controller.resetModel() },
++                        modifier = Modifier.fillMaxWidth()
++                    ) {
++                        Text("DELETE MODEL FILE & START OVER", color = ChatError)
++                    }
++                }
++            }
++
++            SetupPhase.CHECKING, SetupPhase.LOADING -> {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    CircularProgressIndicator(
++                        modifier = Modifier.size(22.dp),
++                        strokeWidth = 2.5.dp,
++                        color = ChatCyan
++                    )
++                    Spacer(Modifier.width(12.dp))
+                     Text(
+-                        message.message,
+-                        color = Color.White,
+-                        fontSize = 14.sp
++                        state.message,
++                        color = ChatText,
++                        fontSize = 13.sp,
++                        lineHeight = 19.sp
+                     )
+                 }
+             }
+-        }
+ 
+-        Row {
+-            OutlinedTextField(
+-                value = input,
+-                onValueChange = { input = it },
+-                modifier = Modifier.weight(1f),
+-                placeholder = { Text("Ask MINIMAL...") },
+-                singleLine = true,
+-                enabled = status.isReady && !busy
+-            )
++            SetupPhase.DOWNLOADING, SetupPhase.WAITING_NETWORK -> {
++                val waiting = state.phase == SetupPhase.WAITING_NETWORK
++                val hasProgress = state.downloadedBytes > 0 &&
++                    state.totalBytes > 0
+ 
+-            Spacer(Modifier.width(8.dp))
++                Text(
++                    if (waiting) "Waiting to download" else "Downloading model",
++                    color = if (waiting) ChatWarn else ChatText,
++                    fontSize = 15.sp,
++                    fontWeight = FontWeight.SemiBold
++                )
++                Spacer(Modifier.height(10.dp))
+ 
+-            Button(
+-                enabled = status.isReady &&
+-                    !busy &&
+-                    input.isNotBlank(),
+-                onClick = {
+-                    val prompt = input.trim()
+-
+-                    if (prompt.isNotEmpty()) {
+-                        input = ""
+-                        messages.add(ChatMessage(prompt, true))
+-                        messages.add(ChatMessage("", false))
+-                        busy = true
+-
+-                        val response = StringBuilder()
+-
+-                        controller.sendMessage(
+-                            prompt = prompt,
+-                            onResponse = { part ->
+-                                response.append(part)
+-                                messages[messages.lastIndex] =
+-                                    ChatMessage(
+-                                        response.toString(),
+-                                        false
+-                                    )
+-                            },
+-                            onComplete = {
+-                                busy = false
+-                                val answer = response.toString()
+-                                if (answer.isNotBlank()) {
+-                                    onSpeak(answer)
++                if (hasProgress) {
++                    LinearProgressIndicator(
++                        progress = { state.progress / 100f },
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .height(8.dp),
++                        color = ChatCyan,
++                        trackColor = Color(0xFF26384A)
++                    )
++                } else {
++                    LinearProgressIndicator(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .height(8.dp),
++                        color = ChatCyan,
++                        trackColor = Color(0xFF26384A)
++                    )
++                }
++
++                if (hasProgress) {
++                    Spacer(Modifier.height(8.dp))
++                    Row(
++                        modifier = Modifier.fillMaxWidth(),
++                        horizontalArrangement = Arrangement.SpaceBetween
++                    ) {
++                        Text(
++                            "${state.progress}%",
++                            color = ChatCyan,
++                            fontSize = 14.sp,
++                            fontWeight = FontWeight.Bold
++                        )
++                        Text(
++                            buildString {
++                                append(formatBytes(state.downloadedBytes))
++                                append(" / ")
++                                append(formatBytes(state.totalBytes))
++                                if (state.speedBytesPerSec > 0) {
++                                    append("  •  ")
++                                    append(formatBytes(state.speedBytesPerSec))
++                                    append("/s")
+                                 }
+                             },
+-                            onFailure = { error ->
+-                                busy = false
+-                                messages[messages.lastIndex] =
+-                                    ChatMessage(
+-                                        "AI error: $error",
+-                                        false
+-                                    )
+-                            }
++                            color = ChatMuted,
++                            fontSize = 12.sp
+                         )
+                     }
+                 }
+-            ) {
+-                Text("SEND")
++
++                Spacer(Modifier.height(8.dp))
++                Text(
++                    state.message,
++                    color = ChatMuted,
++                    fontSize = 12.sp,
++                    lineHeight = 18.sp
++                )
++                Text(
++                    "You can leave the app; the download continues in the background.",
++                    color = ChatMuted,
++                    fontSize = 11.sp,
++                    lineHeight = 16.sp,
++                    modifier = Modifier.padding(top = 4.dp)
++                )
++
++                Spacer(Modifier.height(12.dp))
++
++                if (waiting) {
++                    Button(
++                        onClick = { controller.prepare(allowMetered = true) },
++                        modifier = Modifier.fillMaxWidth(),
++                        shape = RoundedCornerShape(14.dp)
++                    ) {
++                        Text(
++                            "DOWNLOAD ON ANY NETWORK",
++                            fontWeight = FontWeight.Bold
++                        )
++                    }
++                    Spacer(Modifier.height(8.dp))
++                }
++
++                OutlinedButton(
++                    onClick = { controller.cancelDownload() },
++                    modifier = Modifier.fillMaxWidth(),
++                    shape = RoundedCornerShape(14.dp)
++                ) {
++                    Text("CANCEL", color = ChatMuted)
++                }
+             }
++
++            SetupPhase.READY -> Unit
++        }
++    }
++}
++
++@Composable
++private fun MessageBubble(
++    message: ChatMessage,
++    thinking: Boolean
++) {
++    Row(
++        modifier = Modifier.fillMaxWidth(),
++        horizontalArrangement =
++            if (message.isUser) Arrangement.End else Arrangement.Start
++    ) {
++        Column(
++            modifier = Modifier
++                .widthIn(max = 320.dp)
++                .background(
++                    if (message.isUser) Color(0xFF14364A) else ChatPanel,
++                    RoundedCornerShape(16.dp)
++                )
++                .border(1.dp, ChatBorder, RoundedCornerShape(16.dp))
++                .padding(horizontal = 14.dp, vertical = 11.dp)
++        ) {
++            Text(
++                if (message.isUser) "YOU" else "MINIMAL",
++                color = ChatCyan,
++                fontSize = 10.sp,
++                fontWeight = FontWeight.Bold,
++                letterSpacing = 1.sp
++            )
++
++            Spacer(Modifier.height(4.dp))
++
++            Text(
++                if (thinking) "Thinking..." else message.message,
++                color = if (thinking) ChatMuted else ChatText,
++                fontSize = 14.sp,
++                lineHeight = 21.sp
++            )
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/jarvis/android/AiController.kt b/app/src/main/java/com/jarvis/android/AiController.kt
+index 2f55582..53e6e10 100644
+--- a/app/src/main/java/com/jarvis/android/AiController.kt
++++ b/app/src/main/java/com/jarvis/android/AiController.kt
+@@ -1,209 +1,445 @@
+ package com.jarvis.android
+ 
++import android.app.DownloadManager
+ import android.content.Context
+ import android.os.Handler
+ import android.os.Looper
+-import android.app.DownloadManager
++import android.os.SystemClock
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateListOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import java.util.concurrent.Executors
++
++enum class SetupPhase {
++    IDLE,
++    CHECKING,
++    DOWNLOADING,
++    WAITING_NETWORK,
++    LOADING,
++    READY,
++    ERROR
++}
+ 
+ data class AiControllerState(
+     val message: String,
++    val phase: SetupPhase = SetupPhase.IDLE,
+     val progress: Int = 0,
+     val downloadedBytes: Long = 0L,
+     val totalBytes: Long = 0L,
+-    val isReady: Boolean = false,
+-    val isBusy: Boolean = false
+-)
++    val speedBytesPerSec: Long = 0L,
++    val canReset: Boolean = false
++) {
++    val isReady: Boolean
++        get() = phase == SetupPhase.READY
++
++    val isBusy: Boolean
++        get() = phase == SetupPhase.CHECKING ||
++            phase == SetupPhase.DOWNLOADING ||
++            phase == SetupPhase.WAITING_NETWORK ||
++            phase == SetupPhase.LOADING
++}
+ 
++/**
++ * Owns the AI setup state and the chat history so they survive tab
++ * switches. The state is Compose-observable: screens just read
++ * [state], [messages] and [generating].
++ */
+ class AiController(context: Context) {
+ 
+     private val downloader = ModelDownloader(context)
+     private val aiEngine = LocalAiEngine(context)
+     private val handler = Handler(Looper.getMainLooper())
++    private val ioExecutor = Executors.newSingleThreadExecutor()
+ 
+     @Volatile
+     private var closed = false
+ 
+-    private var downloadId: Long? = null
+-    private var currentCallback: ((AiControllerState) -> Unit)? = null
++    var state by mutableStateOf(
++        AiControllerState("The offline AI model is not set up yet.")
++    )
++        private set
++
++    var generating by mutableStateOf(false)
++        private set
++
++    val messages = mutableStateListOf(
++        ChatMessage(
++            "Hi, I'm MINIMAL. Set up the offline AI model above, " +
++                "then ask me anything.",
++            false
++        )
++    )
++
++    private var expectedTotal = 0L
++    private var pollStartedAt = 0L
++    private var lastBytes = 0L
++    private var lastSampleAt = 0L
++    private var lastSpeed = 0L
+ 
+     private val pollTask = object : Runnable {
+         override fun run() {
+             if (closed) return
+ 
+-            val id = downloadId ?: return
++            val id = downloader.activeDownloadId() ?: return
+             val status = downloader.getDownloadStatus(id)
+ 
+             if (status == null) {
+-                publish(
+-                    message = "Checking download status...",
+-                    busy = true
++                downloader.clearActive()
++                setError(
++                    "The download was cancelled or removed. " +
++                        "Tap the button to start again."
+                 )
+-                handler.postDelayed(this, 1500)
+                 return
+             }
+ 
+             when (status.status) {
+-                DownloadManager.STATUS_PENDING,
+-                DownloadManager.STATUS_RUNNING -> {
+-                    publish(
+-                        message = "Downloading MINIMAL AI model...",
+-                        progress = status.progress,
+-                        downloadedBytes = status.downloadedBytes,
+-                        totalBytes = status.totalBytes,
+-                        busy = true
+-                    )
+-                    handler.postDelayed(this, 1000)
+-                }
+-
+-                DownloadManager.STATUS_PAUSED -> {
+-                    publish(
+-                        message = "Download paused. Connect to Wi-Fi and check your connection.",
+-                        progress = status.progress,
+-                        downloadedBytes = status.downloadedBytes,
+-                        totalBytes = status.totalBytes,
+-                        busy = true
+-                    )
+-                    handler.postDelayed(this, 3000)
+-                }
+-
+                 DownloadManager.STATUS_SUCCESSFUL -> {
+-                    downloadId = null
++                    downloader.markComplete()
+                     initializeModel()
+                 }
+ 
+                 DownloadManager.STATUS_FAILED -> {
+-                    downloadId = null
+-                    publish(
+-                        message = "Model download failed. Error code: ${status.reason}. Tap retry to try again.",
+-                        progress = status.progress,
+-                        downloadedBytes = status.downloadedBytes,
+-                        totalBytes = status.totalBytes
+-                    )
++                    val message = describeFailure(status.reason)
++                    downloader.discardModel()
++                    setError(message)
++                }
++
++                else -> {
++                    showDownloadProgress(status)
++                    handler.postDelayed(this, 1000)
+                 }
+             }
+         }
+     }
+ 
+-    fun prepare(
+-        onState: (AiControllerState) -> Unit
+-    ) {
+-        if (closed) return
++    init {
++        resume()
++    }
+ 
+-        currentCallback = onState
++    /** Picks up where the last session stopped. */
++    private fun resume() {
++        when {
++            downloader.isModelReady() -> initializeModel()
+ 
+-        if (downloadId != null) {
+-            handler.removeCallbacks(pollTask)
+-            handler.post(pollTask)
+-            return
++            downloader.activeDownloadId() != null -> {
++                update(
++                    AiControllerState(
++                        "Resuming model download...",
++                        SetupPhase.DOWNLOADING
++                    )
++                )
++                startPolling()
++            }
+         }
++    }
++
++    /**
++     * Starts (or resumes) setup.
++     *
++     * @param allowMetered also download over mobile data / metered Wi-Fi
++     *   (hotspots and data-saver networks count as metered).
++     */
++    fun prepare(allowMetered: Boolean = false) {
++        if (closed) return
++
++        val phase = state.phase
++        if (phase == SetupPhase.CHECKING ||
++            phase == SetupPhase.LOADING ||
++            phase == SetupPhase.READY
++        ) return
+ 
+         if (downloader.isModelReady()) {
+             initializeModel()
+             return
+         }
+ 
+-        try {
+-            val id = downloader.startDownload()
+-            downloadId = id
++        if (downloader.activeDownloadId() != null) {
++            if (allowMetered && !downloader.allowMetered) {
++                // Restart with the less strict network rule.
++                handler.removeCallbacks(pollTask)
++                downloader.discardModel()
++            } else {
++                startPolling()
++                return
++            }
++        }
++
++        beginDownload(allowMetered)
++    }
+ 
+-            publish(
+-                message = "Starting MINIMAL AI download...",
+-                busy = true
++    private fun beginDownload(allowMetered: Boolean) {
++        update(
++            AiControllerState(
++                "Checking the model server...",
++                SetupPhase.CHECKING
+             )
++        )
+ 
+-            handler.removeCallbacks(pollTask)
+-            handler.post(pollTask)
++        ioExecutor.execute {
++            val check = downloader.preflight()
+ 
+-        } catch (error: Exception) {
+-            publish(
+-                message = error.message
+-                    ?: "Could not start model download."
+-            )
++            handler.post {
++                if (closed) return@post
++
++                if (!check.ok) {
++                    setError(check.message)
++                    return@post
++                }
++
++                try {
++                    expectedTotal = check.totalBytes
++                    downloader.startDownload(allowMetered)
++
++                    update(
++                        AiControllerState(
++                            "Starting download...",
++                            SetupPhase.DOWNLOADING,
++                            totalBytes = expectedTotal
++                        )
++                    )
++                    startPolling()
++                } catch (error: Exception) {
++                    setError(
++                        error.message ?: "Could not start the download."
++                    )
++                }
++            }
+         }
+     }
+ 
+-    private fun initializeModel() {
+-        if (closed) return
++    fun cancelDownload() {
++        handler.removeCallbacks(pollTask)
++        downloader.discardModel()
++        update(
++            AiControllerState(
++                "Download cancelled.",
++                SetupPhase.IDLE
++            )
++        )
++    }
+ 
+-        publish(
+-            message = "Download complete. Loading MINIMAL AI model...",
+-            progress = 100,
+-            busy = true
++    /** Deletes the model file so it can be downloaded again. */
++    fun resetModel() {
++        handler.removeCallbacks(pollTask)
++        downloader.discardModel()
++        update(
++            AiControllerState(
++                "The model was removed. Download it again to continue.",
++                SetupPhase.IDLE
++            )
+         )
++    }
+ 
+-        aiEngine.initialize(downloader.modelFile) { success, message ->
+-            if (closed) return@initialize
++    private fun startPolling() {
++        pollStartedAt = SystemClock.elapsedRealtime()
++        lastBytes = 0L
++        lastSampleAt = 0L
++        lastSpeed = 0L
+ 
+-            if (success) {
+-                publish(
+-                    message = message,
+-                    progress = 100,
+-                    ready = true
+-                )
++        handler.removeCallbacks(pollTask)
++        handler.post(pollTask)
++    }
++
++    private fun showDownloadProgress(status: ModelDownloadStatus) {
++        val now = SystemClock.elapsedRealtime()
++        updateSpeed(status.downloadedBytes, now)
++
++        val total =
++            if (status.totalBytes > 0) status.totalBytes else expectedTotal
++
++        val progress =
++            if (total > 0) {
++                ((status.downloadedBytes * 100) / total).toInt()
++            } else 0
++
++        val transferring =
++            status.status == DownloadManager.STATUS_RUNNING &&
++                status.downloadedBytes > 0
++
++        val stalled =
++            status.downloadedBytes == 0L &&
++                now - pollStartedAt > STALL_MS
++
++        val paused = status.status == DownloadManager.STATUS_PAUSED
++
++        val phase =
++            if (!transferring && (paused || stalled)) {
++                SetupPhase.WAITING_NETWORK
+             } else {
+-                publish(
+-                    message = message,
+-                    progress = 100
+-                )
++                SetupPhase.DOWNLOADING
+             }
++
++        val message = when {
++            transferring -> "Downloading MINIMAL AI model..."
++
++            paused && status.reason ==
++                DownloadManager.PAUSED_QUEUED_FOR_WIFI ->
++                "Waiting for an unmetered Wi-Fi connection. If you're on " +
++                    "a hotspot or your Wi-Fi is set as metered, choose " +
++                    "\"Download on any network\"."
++
++            paused && status.reason ==
++                DownloadManager.PAUSED_WAITING_FOR_NETWORK ->
++                "Waiting for an internet connection..."
++
++            paused && status.reason ==
++                DownloadManager.PAUSED_WAITING_TO_RETRY ->
++                "Connection interrupted. Retrying automatically..."
++
++            stalled && !downloader.allowMetered ->
++                "Still waiting to start. Your connection may be metered " +
++                    "(hotspot or data-saver Wi-Fi). Try " +
++                    "\"Download on any network\"."
++
++            stalled ->
++                "Still waiting to start. Check that your internet " +
++                    "connection is working."
++
++            else -> "Connecting to the model server..."
+         }
++
++        update(
++            AiControllerState(
++                message = message,
++                phase = phase,
++                progress = progress.coerceIn(0, 100),
++                downloadedBytes = status.downloadedBytes,
++                totalBytes = total,
++                speedBytesPerSec = lastSpeed
++            )
++        )
+     }
+ 
+-    fun sendMessage(
+-        prompt: String,
+-        onResponse: (String) -> Unit,
+-        onComplete: () -> Unit,
+-        onFailure: (String) -> Unit
+-    ) {
+-        if (closed) {
+-            onFailure("AI controller is closed.")
++    private fun updateSpeed(bytes: Long, now: Long) {
++        if (lastSampleAt == 0L || bytes < lastBytes) {
++            lastSampleAt = now
++            lastBytes = bytes
+             return
+         }
+ 
+-        if (!downloader.isModelReady()) {
+-            onFailure("Download the AI model first.")
+-            return
++        val elapsed = now - lastSampleAt
++        if (elapsed >= 1000) {
++            val instant = (bytes - lastBytes) * 1000 / elapsed
++            lastSpeed =
++                if (lastSpeed == 0L) instant
++                else (lastSpeed * 0.6 + instant * 0.4).toLong()
++            lastBytes = bytes
++            lastSampleAt = now
+         }
++    }
+ 
+-        aiEngine.sendMessage(
+-            prompt = prompt,
+-            onText = onResponse,
+-            onComplete = onComplete,
+-            onFailure = onFailure
+-        )
++    private fun describeFailure(reason: Int): String {
++        val detail = when (reason) {
++            DownloadManager.ERROR_INSUFFICIENT_SPACE ->
++                "Not enough free storage on this phone."
++            DownloadManager.ERROR_DEVICE_NOT_FOUND ->
++                "Storage is not available."
++            DownloadManager.ERROR_FILE_ERROR ->
++                "Could not write the file to storage."
++            DownloadManager.ERROR_HTTP_DATA_ERROR ->
++                "The connection dropped during the download."
++            DownloadManager.ERROR_TOO_MANY_REDIRECTS ->
++                "The download link redirected too many times."
++            DownloadManager.ERROR_CANNOT_RESUME ->
++                "The download could not be resumed."
++            404 -> "The model file was not found (HTTP 404)."
++            401, 403 -> "The server refused access (HTTP $reason)."
++            else -> "Error code $reason."
++        }
++        return "Model download failed. $detail Tap retry to try again."
+     }
+ 
+-    private fun publish(
+-        message: String,
+-        progress: Int = 0,
+-        downloadedBytes: Long = 0L,
+-        totalBytes: Long = 0L,
+-        ready: Boolean = false,
+-        busy: Boolean = false
+-    ) {
++    private fun initializeModel() {
+         if (closed) return
+ 
+-        handler.post {
+-            if (!closed) {
+-                currentCallback?.invoke(
++        update(
++            AiControllerState(
++                "Loading the AI model into memory. This can take a moment...",
++                SetupPhase.LOADING,
++                progress = 100
++            )
++        )
++
++        aiEngine.initialize(downloader.modelFile) { success, message ->
++            if (closed) return@initialize
++
++            if (success) {
++                update(
+                     AiControllerState(
+-                        message = message,
+-                        progress = progress.coerceIn(0, 100),
+-                        downloadedBytes = downloadedBytes,
+-                        totalBytes = totalBytes,
+-                        isReady = ready,
+-                        isBusy = busy
++                        message,
++                        SetupPhase.READY,
++                        progress = 100
+                     )
+                 )
++            } else {
++                setError("Could not load the AI model: $message")
++            }
++        }
++    }
++
++    /** Sends a chat message and streams the reply into [messages]. */
++    fun send(prompt: String, onSpeak: (String) -> Unit) {
++        val text = prompt.trim()
++
++        if (closed || text.isEmpty() || generating || !state.isReady) return
++
++        messages.add(ChatMessage(text, true))
++        messages.add(ChatMessage("", false))
++        generating = true
++
++        val response = StringBuilder()
++
++        aiEngine.sendMessage(
++            prompt = text,
++            onText = { part ->
++                response.append(part)
++                replaceLast(response.toString())
++            },
++            onComplete = {
++                generating = false
++                val answer = response.toString()
++                if (answer.isBlank()) {
++                    replaceLast("(No response. Please try again.)")
++                } else {
++                    onSpeak(answer)
++                }
++            },
++            onFailure = { error ->
++                generating = false
++                replaceLast("Something went wrong: $error")
+             }
++        )
++    }
++
++    private fun replaceLast(text: String) {
++        if (messages.isNotEmpty()) {
++            messages[messages.lastIndex] = ChatMessage(text, false)
+         }
+     }
+ 
++    private fun setError(message: String) {
++        update(
++            AiControllerState(
++                message = message,
++                phase = SetupPhase.ERROR,
++                canReset = downloader.modelFile.isFile
++            )
++        )
++    }
++
++    private fun update(newState: AiControllerState) {
++        if (!closed) state = newState
++    }
++
+     fun close() {
+         closed = true
+         handler.removeCallbacksAndMessages(null)
+-        currentCallback = null
++        ioExecutor.shutdown()
+         aiEngine.close()
+     }
+-}
+ 
++    private companion object {
++        const val STALL_MS = 15_000L
++    }
++}
+diff --git a/app/src/main/java/com/jarvis/android/LocalAiEngine.kt b/app/src/main/java/com/jarvis/android/LocalAiEngine.kt
+index 64ec315..ee0ffba 100644
+--- a/app/src/main/java/com/jarvis/android/LocalAiEngine.kt
++++ b/app/src/main/java/com/jarvis/android/LocalAiEngine.kt
+@@ -38,6 +38,12 @@ class LocalAiEngine(context: Context) {
+                     "AI model is not downloaded yet."
+                 }
+ 
++                // Release a previous engine when retrying.
++                conversation?.close()
++                conversation = null
++                engine?.close()
++                engine = null
++
+                 val newEngine = Engine(
+                     EngineConfig(
+                         modelPath = modelFile.absolutePath,
+diff --git a/app/src/main/java/com/jarvis/android/MainActivity.kt b/app/src/main/java/com/jarvis/android/MainActivity.kt
+index c9861ae..8ce3afd 100644
+--- a/app/src/main/java/com/jarvis/android/MainActivity.kt
++++ b/app/src/main/java/com/jarvis/android/MainActivity.kt
+@@ -2,6 +2,7 @@ package com.jarvis.android
+ 
+ import android.Manifest
+ import android.content.Intent
++import android.widget.Toast
+ import android.os.Bundle
+ import android.speech.RecognitionListener
+ import android.speech.RecognizerIntent
+@@ -29,6 +30,7 @@ import androidx.compose.runtime.*
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
++import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.graphicsLayer
+@@ -104,9 +106,9 @@ class MainActivity : ComponentActivity() {
+         }
+     }
+ 
+-    private fun startListening(callback: (String) -> Unit) {
++    private fun startListening(callback: (String?, String?) -> Unit) {
+         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+-            callback("Speech recognition is unavailable.")
++            callback(null, "Speech recognition is unavailable on this device.")
+             return
+         }
+ 
+@@ -124,14 +126,19 @@ class MainActivity : ComponentActivity() {
+                 override fun onPartialResults(results: Bundle?) {}
+ 
+                 override fun onError(error: Int) {
+-                    callback("I couldn't recognize that. Please try again.")
++                    callback(null, "I couldn't recognize that. Please try again.")
+                 }
+ 
+                 override fun onResults(results: Bundle?) {
+                     val words = results?.getStringArrayList(
+                         SpeechRecognizer.RESULTS_RECOGNITION
+                     )
+-                    callback(words?.firstOrNull() ?: "No speech detected.")
++                    val text = words?.firstOrNull()
++                    if (text.isNullOrBlank()) {
++                        callback(null, "No speech detected.")
++                    } else {
++                        callback(text, null)
++                    }
+                 }
+             }
+         )
+@@ -161,29 +168,38 @@ fun JarvisApp(
+     voices: List<String>,
+     voiceReady: Boolean,
+     selectedVoice: String,
+-    onListen: ((String) -> Unit) -> Unit,
++    onListen: ((String?, String?) -> Unit) -> Unit,
+     onSelectVoice: (String) -> Boolean,
+     onPreviewVoice: (String) -> Unit,
+     onSpeak: (String) -> Unit
+ ) {
+     var page by remember { mutableStateOf("HOME") }
+     var listening by remember { mutableStateOf(false) }
++    var pendingVoiceText by remember { mutableStateOf("") }
++    val context = LocalContext.current
+ 
+     val permissionLauncher = rememberLauncherForActivityResult(
+         ActivityResultContracts.RequestPermission()
+     ) { granted ->
+         if (granted) {
+             listening = true
+-            onListen { result ->
++            onListen { text, error ->
+                 listening = false
+-                if (result.isNotBlank()) {
+-                    // Recognition result is passed to the chat screen
+-                    // in the next interaction through its own input.
++                if (!text.isNullOrBlank()) {
++                    // Hand the recognized speech to the chat screen.
++                    pendingVoiceText = text
+                     page = "CHAT"
++                } else if (error != null) {
++                    Toast.makeText(context, error, Toast.LENGTH_SHORT).show()
+                 }
+             }
+         } else {
+             listening = false
++            Toast.makeText(
++                context,
++                "Microphone permission is needed for voice.",
++                Toast.LENGTH_SHORT
++            ).show()
+         }
+     }
+ 
+@@ -234,6 +250,7 @@ fun JarvisApp(
+                 modifier = Modifier
+                     .fillMaxSize()
+                     .padding(padding)
++                    .statusBarsPadding()
+                     .background(
+                         Brush.verticalGradient(
+                             listOf(
+@@ -261,6 +278,8 @@ fun JarvisApp(
+ 
+                     "CHAT" -> AiChatScreen(
+                         controller = aiController,
++                        pendingVoiceText = pendingVoiceText,
++                        onVoiceTextConsumed = { pendingVoiceText = "" },
+                         onSpeak = onSpeak
+                     )
+ 
+diff --git a/app/src/main/java/com/jarvis/android/ModelDownloader.kt b/app/src/main/java/com/jarvis/android/ModelDownloader.kt
+index 6e49379..c2cf96a 100644
+--- a/app/src/main/java/com/jarvis/android/ModelDownloader.kt
++++ b/app/src/main/java/com/jarvis/android/ModelDownloader.kt
+@@ -5,31 +5,40 @@ import android.content.Context
+ import android.net.Uri
+ import android.os.Environment
+ import java.io.File
++import java.net.HttpURLConnection
++import java.net.SocketTimeoutException
++import java.net.URL
++import java.net.UnknownHostException
+ 
+ data class ModelDownloadStatus(
+     val status: Int,
+     val downloadedBytes: Long,
+     val totalBytes: Long,
+     val reason: Int
+-) {
+-    val progress: Int
+-        get() = if (totalBytes > 0) {
+-            ((downloadedBytes * 100) / totalBytes).toInt()
+-        } else {
+-            0
+-        }
+-
+-    val isComplete: Boolean
+-        get() = status == DownloadManager.STATUS_SUCCESSFUL
+-
+-    val isFailed: Boolean
+-        get() = status == DownloadManager.STATUS_FAILED
+-}
++)
+ 
++data class PreflightResult(
++    val ok: Boolean,
++    val totalBytes: Long,
++    val message: String
++)
++
++/**
++ * Downloads the offline AI model with Android's DownloadManager.
++ *
++ * The active download id and a "complete" flag are stored in
++ * SharedPreferences so the app can resume after being closed and never
++ * mistakes a half-downloaded file for a finished model.
++ */
+ class ModelDownloader(context: Context) {
+ 
+     private val appContext = context.applicationContext
+ 
++    private val prefs = appContext.getSharedPreferences(
++        PREFS_NAME,
++        Context.MODE_PRIVATE
++    )
++
+     private val downloadManager =
+         appContext.getSystemService(
+             Context.DOWNLOAD_SERVICE
+@@ -43,29 +52,120 @@ class ModelDownloader(context: Context) {
+             MODEL_FILE_NAME
+         )
+ 
++    /** True only when a download finished successfully. */
+     fun isModelReady(): Boolean {
+         return modelFile.isFile &&
+-            modelFile.length() > MIN_MODEL_SIZE
++            modelFile.length() > 0L &&
++            activeDownloadId() == null &&
++            prefs.getBoolean(KEY_COMPLETE, false)
++    }
++
++    fun activeDownloadId(): Long? {
++        val id = prefs.getLong(KEY_DOWNLOAD_ID, -1L)
++        return if (id >= 0L) id else null
+     }
+ 
+-    fun startDownload(): Long {
+-        check(!isModelReady()) {
+-            "The AI model is already downloaded."
++    /** Whether the active download was started with mobile data allowed. */
++    val allowMetered: Boolean
++        get() = prefs.getBoolean(KEY_ALLOW_METERED, false)
++
++    /**
++     * Quick server check done before the download starts. Surfaces
++     * problems like a wrong link, a login requirement, no internet or
++     * not enough storage instead of silently sitting at 0%.
++     *
++     * Blocking network call: run it off the main thread.
++     */
++    fun preflight(): PreflightResult {
++        var connection: HttpURLConnection? = null
++
++        return try {
++            connection = (URL(MODEL_URL).openConnection() as HttpURLConnection)
++                .apply {
++                    connectTimeout = 15_000
++                    readTimeout = 15_000
++                    instanceFollowRedirects = true
++                    requestMethod = "GET"
++                    setRequestProperty("Range", "bytes=0-0")
++                    setRequestProperty("User-Agent", "MINIMAL-Android")
++                }
++
++            val code = connection.responseCode
++
++            when {
++                code == 200 || code == 206 -> {
++                    val total = connection
++                        .getHeaderField("Content-Range")
++                        ?.substringAfterLast('/')
++                        ?.toLongOrNull()
++                        ?: if (code == 200) connection.contentLengthLong else -1L
++
++                    val dir = modelFile.parentFile
++                    dir?.mkdirs()
++                    val free = dir?.usableSpace ?: Long.MAX_VALUE
++
++                    if (total > 0 && free < total + SPACE_MARGIN) {
++                        PreflightResult(
++                            false,
++                            total,
++                            "Not enough free storage. The model needs about " +
++                                "${total / MB} MB but only ${free / MB} MB is free."
++                        )
++                    } else {
++                        PreflightResult(true, total, "OK")
++                    }
++                }
++
++                code == 401 || code == 403 -> PreflightResult(
++                    false, 0L,
++                    "The model server refused access (HTTP $code). " +
++                        "The model may need a login or may have moved."
++                )
++
++                code == 404 -> PreflightResult(
++                    false, 0L,
++                    "The model file was not found on the server (HTTP 404). " +
++                        "The download link inside the app needs to be updated."
++                )
++
++                else -> PreflightResult(
++                    false, 0L,
++                    "The model server returned an unexpected response (HTTP $code)."
++                )
++            }
++        } catch (e: UnknownHostException) {
++            PreflightResult(
++                false, 0L,
++                "No internet connection. Check your Wi-Fi or mobile data and try again."
++            )
++        } catch (e: SocketTimeoutException) {
++            PreflightResult(
++                false, 0L,
++                "The model server took too long to respond. Check your connection and try again."
++            )
++        } catch (e: Exception) {
++            PreflightResult(
++                false, 0L,
++                "Could not reach the model server: ${e.message ?: "unknown error"}"
++            )
++        } finally {
++            connection?.disconnect()
+         }
++    }
+ 
+-        val request = DownloadManager.Request(
+-            Uri.parse(MODEL_URL)
+-        )
++    fun startDownload(allowMetered: Boolean): Long {
++        // Remove any stale or partial file so DownloadManager does not
++        // fail with "file already exists".
++        discardModel()
++
++        val request = DownloadManager.Request(Uri.parse(MODEL_URL))
+             .setTitle("MINIMAL AI Model")
+-            .setDescription(
+-                "Downloading SmolLM2 360M for offline AI."
+-            )
++            .setDescription("Downloading SmolLM2 360M for offline AI.")
+             .setMimeType("application/octet-stream")
+             .setNotificationVisibility(
+-                DownloadManager.Request
+-                    .VISIBILITY_VISIBLE_NOTIFY_COMPLETED
++                DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+             )
+-            .setAllowedOverMetered(false)
++            .setAllowedOverMetered(allowMetered)
+             .setAllowedOverRoaming(false)
+             .setDestinationInExternalFilesDir(
+                 appContext,
+@@ -73,13 +173,18 @@ class ModelDownloader(context: Context) {
+                 MODEL_FILE_NAME
+             )
+ 
+-        return downloadManager.enqueue(request)
+-    }
++        val id = downloadManager.enqueue(request)
+ 
+-    fun getDownloadStatus(
+-        downloadId: Long
+-    ): ModelDownloadStatus? {
++        prefs.edit()
++            .putLong(KEY_DOWNLOAD_ID, id)
++            .putBoolean(KEY_ALLOW_METERED, allowMetered)
++            .putBoolean(KEY_COMPLETE, false)
++            .apply()
++
++        return id
++    }
+ 
++    fun getDownloadStatus(downloadId: Long): ModelDownloadStatus? {
+         val cursor = downloadManager.query(
+             DownloadManager.Query().setFilterById(downloadId)
+         ) ?: return null
+@@ -89,9 +194,7 @@ class ModelDownloader(context: Context) {
+ 
+             return ModelDownloadStatus(
+                 status = it.getInt(
+-                    it.getColumnIndexOrThrow(
+-                        DownloadManager.COLUMN_STATUS
+-                    )
++                    it.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)
+                 ),
+                 downloadedBytes = it.getLong(
+                     it.getColumnIndexOrThrow(
+@@ -104,14 +207,35 @@ class ModelDownloader(context: Context) {
+                     )
+                 ),
+                 reason = it.getInt(
+-                    it.getColumnIndexOrThrow(
+-                        DownloadManager.COLUMN_REASON
+-                    )
++                    it.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON)
+                 )
+             )
+         }
+     }
+ 
++    fun markComplete() {
++        prefs.edit()
++            .putBoolean(KEY_COMPLETE, true)
++            .remove(KEY_DOWNLOAD_ID)
++            .apply()
++    }
++
++    fun clearActive() {
++        prefs.edit().remove(KEY_DOWNLOAD_ID).apply()
++    }
++
++    /** Cancels any running download and deletes the model file. */
++    fun discardModel() {
++        activeDownloadId()?.let { downloadManager.remove(it) }
++
++        prefs.edit()
++            .remove(KEY_DOWNLOAD_ID)
++            .putBoolean(KEY_COMPLETE, false)
++            .apply()
++
++        if (modelFile.exists()) modelFile.delete()
++    }
++
+     companion object {
+         const val MODEL_FILE_NAME =
+             "SmolLM2_360M_instruct.litertlm"
+@@ -119,7 +243,12 @@ class ModelDownloader(context: Context) {
+         const val MODEL_URL =
+             "https://huggingface.co/litert-community/SmolLM2-360M-Instruct/resolve/main/SmolLM2_360M_instruct.litertlm"
+ 
+-        private const val MIN_MODEL_SIZE =
+-            300_000_000L
++        private const val PREFS_NAME = "minimal_model"
++        private const val KEY_DOWNLOAD_ID = "download_id"
++        private const val KEY_COMPLETE = "complete"
++        private const val KEY_ALLOW_METERED = "allow_metered"
++
++        private const val MB = 1024L * 1024L
++        private const val SPACE_MARGIN = 100L * MB
+     }
+ }
+diff --git a/app/src/main/java/com/jarvis/android/VoiceEngine.kt b/app/src/main/java/com/jarvis/android/VoiceEngine.kt
+index 1670836..55243c3 100644
+--- a/app/src/main/java/com/jarvis/android/VoiceEngine.kt
++++ b/app/src/main/java/com/jarvis/android/VoiceEngine.kt
+@@ -85,7 +85,7 @@ class VoiceEngine(
+      */
+     fun previewVoice(voiceName: String) {
+         if (selectVoice(voiceName)) {
+-            speak("Hello. I am JARVIS. Voice system is ready.")
++            speak("Hello. I am MINIMAL. This is how I sound.")
+         }
+     }
+ 
+-- 
+2.43.0
+
