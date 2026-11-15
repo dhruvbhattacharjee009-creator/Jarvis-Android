@@ -1,4 +1,3 @@
-
 package com.jarvis.android
 
 import android.Manifest
@@ -45,6 +44,7 @@ class MainActivity : ComponentActivity() {
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var voiceEngine: VoiceEngine? = null
+    private lateinit var aiController: AiController
 
     private val availableVoices = mutableStateListOf<String>()
 
@@ -53,6 +53,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        aiController = AiController(this)
 
         voiceEngine = VoiceEngine(this) {
             runOnUiThread {
@@ -73,6 +75,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             JarvisApp(
+                aiController = aiController,
                 voices = availableVoices,
                 voiceReady = voiceReady,
                 selectedVoice = selectedVoice,
@@ -156,12 +159,18 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         speechRecognizer?.destroy()
         voiceEngine?.release()
+
+        if (::aiController.isInitialized) {
+            aiController.close()
+        }
+
         super.onDestroy()
     }
 }
 
 @Composable
 fun JarvisApp(
+    aiController: AiController,
     voices: List<String>,
     voiceReady: Boolean,
     selectedVoice: String,
@@ -173,15 +182,6 @@ fun JarvisApp(
     var page by remember { mutableStateOf("HOME") }
     var input by remember { mutableStateOf("") }
     var listening by remember { mutableStateOf(false) }
-
-    val messages = remember {
-        mutableStateListOf(
-            ChatMessage(
-                "Welcome. JARVIS is ready. Voice controls are available. Cloud intelligence is the next development milestone.",
-                false
-            )
-        )
-    }
 
     val permissionLauncher =
         rememberLauncherForActivityResult(
@@ -273,29 +273,9 @@ fun JarvisApp(
                         onVoice = { page = "VOICE" }
                     )
 
-                    "CHAT" -> ChatScreen(
-                        messages = messages,
-                        input = input,
-                        onInput = { input = it },
-                        onSend = {
-                            val command = input.trim()
-
-                            if (command.isNotEmpty()) {
-                                messages.add(
-                                    ChatMessage(command, true)
-                                )
-
-                                val reply =
-                                    "I have received your message. Real AI conversations will be enabled when the secure AI backend is connected."
-
-                                messages.add(
-                                    ChatMessage(reply, false)
-                                )
-
-                                onSpeak(reply)
-                                input = ""
-                            }
-                        }
+                    "CHAT" -> AiChatScreen(
+                        controller = aiController,
+                        onSpeak = onSpeak
                     )
 
                     "FILES" -> FilesScreen()
@@ -449,85 +429,6 @@ fun HomeScreen(
         )
 
         Spacer(Modifier.height(16.dp))
-    }
-}
-
-@Composable
-fun ChatScreen(
-    messages: List<ChatMessage>,
-    input: String,
-    onInput: (String) -> Unit,
-    onSend: () -> Unit
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(18.dp)
-    ) {
-        Text(
-            "JARVIS CHAT",
-            color = Cyan,
-            fontSize = 23.sp,
-            fontWeight = FontWeight.Bold
-        )
-
-        Text(
-            "THINK · ASK · ACHIEVE",
-            color = Muted,
-            fontSize = 10.sp
-        )
-
-        Spacer(Modifier.height(18.dp))
-
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            items(messages) { message ->
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(
-                            if (message.isUser) Color(0xFF14364A)
-                            else Panel,
-                            RoundedCornerShape(16.dp)
-                        )
-                        .padding(15.dp)
-                ) {
-                    Text(
-                        if (message.isUser) "YOU" else "JARVIS",
-                        color = Cyan,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-
-                    Spacer(Modifier.height(6.dp))
-
-                    Text(
-                        message.message,
-                        color = Color.White,
-                        fontSize = 14.sp
-                    )
-                }
-            }
-        }
-
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = input,
-                onValueChange = onInput,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Ask JARVIS...") },
-                shape = RoundedCornerShape(15.dp),
-                singleLine = true
-            )
-
-            Spacer(Modifier.width(8.dp))
-
-            Button(onClick = onSend) {
-                Text("SEND")
-            }
-        }
     }
 }
 
@@ -806,4 +707,3 @@ fun CreditCard(
         )
     }
 }
-
